@@ -48,12 +48,19 @@ class AudioTranscriberGUI:
         # Backend transcriber
         self.transcriber = None
         self.output_dir = Path.home() / "Desktop" / "Trascrizioni"
-        
+        self.output_dir_var = tk.StringVar(value=str(self.output_dir))
+        self.filename_var = tk.StringVar(value=self._default_filename())
+
         # Stato applicazione
         self.is_recording = False
         self.update_thread = None
         self.should_update = False
-        
+        self.file_transcribing = False
+        self.file_thread = None
+        self.mode_var = tk.StringVar(value='record')
+        self.audio_file_var = tk.StringVar()
+        self.audio_file_var.trace_add('write', lambda *args: self.update_file_controls())
+
         # Queue per aggiornamenti GUI thread-safe
         self.gui_queue = queue.Queue()
         
@@ -62,7 +69,8 @@ class AudioTranscriberGUI:
         
         # Costruzione GUI
         self.build_gui()
-        
+        self.update_file_controls()
+
         # Inizializza transcriber
         self.init_transcriber()
         
@@ -115,6 +123,12 @@ class AudioTranscriberGUI:
         style.configure('Status.TLabel',
                        font=('Arial', 10),
                        background=BG_COLOR)
+
+    def _default_filename(self):
+        return f"meeting_{datetime.now().strftime('%Y%m%d_%H%M')}"
+
+    def reset_filename(self):
+        self.filename_var.set(self._default_filename())
     
     # ========================================================================
     # COSTRUZIONE INTERFACCIA
@@ -138,38 +152,84 @@ class AudioTranscriberGUI:
         config_frame = ttk.LabelFrame(main_frame, text="⚙ Configurazione", padding="10")
         config_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         config_frame.columnconfigure(1, weight=1)
-        
+
+        # Modalità operativa
+        ttk.Label(config_frame, text="Modalità:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        mode_frame = ttk.Frame(config_frame)
+        mode_frame.grid(row=0, column=1, sticky=tk.W, pady=5)
+
+        ttk.Radiobutton(mode_frame,
+                        text="Registra e Trascrivi",
+                        variable=self.mode_var,
+                        value='record',
+                        command=self.on_mode_change).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Radiobutton(mode_frame,
+                        text="Trascrivi File Audio",
+                        variable=self.mode_var,
+                        value='file',
+                        command=self.on_mode_change).pack(side=tk.LEFT)
+
         # Selezione dispositivo audio
-        ttk.Label(config_frame, text="Dispositivo Audio:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        
+        ttk.Label(config_frame, text="Dispositivo Audio:").grid(row=1, column=0, sticky=tk.W, pady=5)
+
         device_frame = ttk.Frame(config_frame)
-        device_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        device_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
         device_frame.columnconfigure(0, weight=1)
-        
+
         self.device_combo = ttk.Combobox(device_frame, state='readonly')
         self.device_combo.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
-        
-        self.refresh_btn = ttk.Button(device_frame, text="🔄", width=3, 
+
+        self.refresh_btn = ttk.Button(device_frame, text="🔄", width=3,
                                       command=self.refresh_devices,
                                       style='Normal.TButton')
         self.refresh_btn.grid(row=0, column=1)
-        
+
+        self.test_device_btn = ttk.Button(device_frame,
+                                          text="🎧 Test",
+                                          width=6,
+                                          command=self.test_device,
+                                          style='Normal.TButton')
+        self.test_device_btn.grid(row=0, column=2, padx=(5, 0))
+
+        # Selezione file audio per trascrizione
+        ttk.Label(config_frame, text="File Audio da Trascrivere:").grid(row=2, column=0, sticky=tk.W, pady=5)
+
+        file_frame = ttk.Frame(config_frame)
+        file_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        file_frame.columnconfigure(0, weight=1)
+
+        self.audio_file_entry = ttk.Entry(file_frame, textvariable=self.audio_file_var, state='disabled')
+        self.audio_file_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+
+        self.file_browse_btn = ttk.Button(file_frame,
+                                          text="📂 Scegli",
+                                          command=self.browse_audio_file,
+                                          style='Normal.TButton',
+                                          state='disabled')
+        self.file_browse_btn.grid(row=0, column=1)
+
         # Selezione cartella output
-        ttk.Label(config_frame, text="Cartella Output:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        
+        ttk.Label(config_frame, text="Cartella Output:").grid(row=3, column=0, sticky=tk.W, pady=5)
+
         output_frame = ttk.Frame(config_frame)
-        output_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        output_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
         output_frame.columnconfigure(0, weight=1)
-        
-        self.output_entry = ttk.Entry(output_frame)
-        self.output_entry.insert(0, str(self.output_dir))
+
+        self.output_entry = ttk.Entry(output_frame, textvariable=self.output_dir_var)
         self.output_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
-        
-        self.browse_btn = ttk.Button(output_frame, text="📁 Sfoglia", 
+
+        self.browse_btn = ttk.Button(output_frame, text="📁 Sfoglia",
                                      command=self.browse_output_dir,
                                      style='Normal.TButton')
         self.browse_btn.grid(row=0, column=1)
-        
+
+        # Nome file output
+        ttk.Label(config_frame, text="Nome File Output:").grid(row=4, column=0, sticky=tk.W, pady=5)
+
+        self.filename_entry = ttk.Entry(config_frame, textvariable=self.filename_var)
+        self.filename_entry.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+
         # ====================================================================
         # SEZIONE 2: CONTROLLI REGISTRAZIONE
         # ====================================================================
@@ -180,7 +240,7 @@ class AudioTranscriberGUI:
         button_frame = ttk.Frame(control_frame)
         button_frame.pack(fill=tk.X, pady=5)
         
-        self.start_btn = ttk.Button(button_frame, 
+        self.start_btn = ttk.Button(button_frame,
                                     text="▶ Avvia Registrazione",
                                     command=self.start_recording,
                                     style='Start.TButton')
@@ -192,6 +252,13 @@ class AudioTranscriberGUI:
                                    style='Stop.TButton',
                                    state='disabled')
         self.stop_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+        self.transcribe_file_btn = ttk.Button(button_frame,
+                                              text="📝 Trascrivi File Audio",
+                                              command=self.transcribe_file,
+                                              style='Start.TButton',
+                                              state='disabled')
+        self.transcribe_file_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         
         # Indicatore livello audio (VU Meter)
         vu_frame = ttk.Frame(control_frame)
@@ -292,7 +359,45 @@ class AudioTranscriberGUI:
                                      style='Status.TLabel',
                                      padding="5")
         self.model_label.pack(side=tk.RIGHT)
-    
+
+    def update_file_controls(self):
+        """Gestisce l'attivazione dei controlli in base alla modalità"""
+        mode = self.mode_var.get()
+        has_file = bool(self.audio_file_var.get().strip())
+
+        if mode == 'record':
+            self.audio_file_entry.state(['disabled'])
+            self.file_browse_btn.state(['disabled'])
+            if not self.is_recording:
+                self.start_btn.state(['!disabled'])
+            if not self.file_transcribing:
+                self.transcribe_file_btn.state(['disabled'])
+        else:
+            if self.file_transcribing:
+                self.audio_file_entry.state(['disabled'])
+                self.file_browse_btn.state(['disabled'])
+            else:
+                self.audio_file_entry.state(['!disabled'])
+                self.file_browse_btn.state(['!disabled'])
+            self.start_btn.state(['disabled'])
+            if has_file and not self.file_transcribing:
+                self.transcribe_file_btn.state(['!disabled'])
+            else:
+                self.transcribe_file_btn.state(['disabled'])
+
+    def on_mode_change(self):
+        if self.is_recording:
+            self.mode_var.set('record')
+            messagebox.showinfo("Modalità bloccata",
+                                "Non puoi cambiare modalità mentre la registrazione è in corso.")
+            return
+
+        if self.file_transcribing:
+            self.mode_var.set('file')
+            return
+
+        self.update_file_controls()
+
     # ========================================================================
     # INIZIALIZZAZIONE BACKEND
     # ========================================================================
@@ -300,6 +405,7 @@ class AudioTranscriberGUI:
         """Inizializza il backend AudioTranscriber"""
         try:
             self.transcriber = AudioTranscriber(output_dir=self.output_dir)
+            self.transcriber.set_transcript_callback(self.handle_transcript_line)
             logger.info("Backend transcriber inizializzato")
         except Exception as e:
             logger.error(f"Errore inizializzazione transcriber: {e}")
@@ -336,10 +442,11 @@ class AudioTranscriberGUI:
             self.device_combo.current(0)
             self.device_combo.state(['!disabled'])
             self.start_btn.state(['!disabled'])
-            
+
             self.update_status(f"✓ Trovati {len(devices)} dispositivi audio", ACCENT_COLOR)
             logger.info(f"Dispositivi audio caricati: {len(devices)}")
-            
+            self.update_file_controls()
+
         except Exception as e:
             logger.error(f"Errore refresh dispositivi: {e}")
             messagebox.showerror("Errore", f"Errore durante il caricamento dispositivi:\n{str(e)}")
@@ -372,22 +479,58 @@ class AudioTranscriberGUI:
             messagebox.showwarning("Attenzione",
                                  "Impossibile cambiare cartella durante la registrazione")
             return
-        
+
         directory = filedialog.askdirectory(
             title="Seleziona cartella per salvare le trascrizioni",
             initialdir=self.output_dir
         )
-        
+
         if directory:
             self.output_dir = Path(directory)
-            self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, str(self.output_dir))
-            
+            self.output_dir_var.set(str(self.output_dir))
+
             # Aggiorna transcriber
             if self.transcriber:
                 self.transcriber.output_dir = self.output_dir
-            
+
             logger.info(f"Output directory cambiata: {self.output_dir}")
+
+    def ensure_output_dir(self):
+        """Restituisce (e crea) la cartella di output selezionata"""
+        path_value = self.output_dir_var.get().strip()
+        if not path_value:
+            path_value = str(self.output_dir)
+
+        target = Path(path_value)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise IOError(f"Impossibile creare cartella output: {e}")
+
+        self.output_dir = target
+        if self.transcriber:
+            self.transcriber.output_dir = target
+
+        return target
+
+    def browse_audio_file(self):
+        """Seleziona il file audio da trascrivere"""
+        if self.is_recording:
+            messagebox.showwarning("Attenzione",
+                                 "Chiudi la registrazione prima di scegliere un file.")
+            return
+
+        filetypes = [
+            ("Audio", "*.wav *.mp3 *.m4a *.flac *.aac"),
+            ("Tutti i file", "*.*")
+        ]
+        filepath = filedialog.askopenfilename(
+            title="Seleziona un file audio",
+            filetypes=filetypes
+        )
+
+        if filepath:
+            self.audio_file_var.set(filepath)
     
     # ========================================================================
     # CONTROLLI REGISTRAZIONE
@@ -396,38 +539,47 @@ class AudioTranscriberGUI:
         """Avvia registrazione e trascrizione"""
         if self.is_recording:
             return
-        
+
+        if self.mode_var.get() != 'record':
+            messagebox.showinfo("Modalità non disponibile",
+                                "Seleziona la modalità 'Registra e Trascrivi' per avviare.")
+            return
+
+        if self.file_transcribing:
+            messagebox.showwarning("Attendi",
+                                   "È in corso una trascrizione di un file audio.")
+            return
+
         # Validazione
         device_index = self.get_selected_device_index()
         if device_index is None:
             messagebox.showerror("Errore", "Seleziona un dispositivo audio valido")
             return
-        
+
         # Conferma output directory
-        if not self.output_dir.exists():
-            try:
-                self.output_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("Errore", 
-                                   f"Impossibile creare cartella output:\n{str(e)}")
-                return
-        
-        # Aggiorna output dir nel transcriber
-        self.transcriber.output_dir = self.output_dir
-        
+        try:
+            self.ensure_output_dir()
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+            return
+
         # Avvia registrazione
         self.update_status("🔄 Avvio registrazione...", WARNING_COLOR)
-        
+
         try:
-            success = self.transcriber.start_recording(device_index=device_index)
-            
+            filename = self.filename_var.get().strip() or None
+            success = self.transcriber.start_recording(
+                device_index=device_index,
+                file_basename=filename
+            )
+
             if not success:
                 messagebox.showerror("Errore",
                                    "Impossibile avviare la registrazione.\n\n"
                                    "Controlla il log per maggiori dettagli.")
                 self.update_status("✗ Errore avvio registrazione", ERROR_COLOR)
                 return
-            
+
             # Aggiorna stato GUI
             self.is_recording = True
             self.start_btn.state(['disabled'])
@@ -435,20 +587,20 @@ class AudioTranscriberGUI:
             self.device_combo.state(['disabled'])
             self.refresh_btn.state(['disabled'])
             self.browse_btn.state(['disabled'])
-            
+            self.test_device_btn.state(['disabled'])
+
             # Pulisci area trascrizione
-            self.transcript_text.config(state='normal')
-            self.transcript_text.delete(1.0, tk.END)
-            self.transcript_text.config(state='disabled')
-            
+            self._wipe_transcript_text()
+
             # Avvia thread aggiornamento
             self.should_update = True
             self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
             self.update_thread.start()
-            
+
             self.update_status("🔴 Registrazione in corso...", ERROR_COLOR)
             logger.info("Registrazione avviata da GUI")
-            
+            self.update_file_controls()
+
         except Exception as e:
             logger.error(f"Errore avvio registrazione: {e}")
             messagebox.showerror("Errore", f"Errore durante l'avvio:\n{str(e)}")
@@ -470,17 +622,24 @@ class AudioTranscriberGUI:
             
             # Ferma registrazione
             success = self.transcriber.stop_recording()
-            
+
             if success:
                 self.update_status("✓ Registrazione completata e salvata", ACCENT_COLOR)
-                
-                # Mostra info file salvati
-                messagebox.showinfo("Completato",
-                                  f"Registrazione salvata con successo!\n\n"
-                                  f"File salvati in:\n{self.output_dir}")
+
+                audio_path = getattr(self.transcriber, 'last_audio_path', None)
+                transcript_path = getattr(self.transcriber, 'last_transcript_path', None)
+                details = "\n".join(
+                    [str(p) for p in [audio_path, transcript_path] if p]
+                ) or str(self.output_dir)
+
+                messagebox.showinfo(
+                    "Completato",
+                    "Registrazione salvata con successo!\n\n" + details
+                )
+                self.reset_filename()
             else:
                 self.update_status("⚠ Registrazione fermata con errori", WARNING_COLOR)
-            
+
             # Ripristina stato GUI
             self.is_recording = False
             self.start_btn.state(['!disabled'])
@@ -488,17 +647,104 @@ class AudioTranscriberGUI:
             self.device_combo.state(['readonly'])
             self.refresh_btn.state(['!disabled'])
             self.browse_btn.state(['!disabled'])
-            
+            self.test_device_btn.state(['!disabled'])
+
             # Reset indicatori
             self.vu_meter['value'] = 0
             self.vu_label['text'] = "0%"
-            
+
             logger.info("Registrazione fermata da GUI")
-            
+            self.update_file_controls()
+
         except Exception as e:
             logger.error(f"Errore stop registrazione: {e}")
             messagebox.showerror("Errore", f"Errore durante l'arresto:\n{str(e)}")
             self.update_status("✗ Errore arresto", ERROR_COLOR)
+
+    def transcribe_file(self):
+        """Trascrive un file audio selezionato"""
+        if self.mode_var.get() != 'file':
+            messagebox.showinfo("Modalità non disponibile",
+                                "Attiva la modalità 'Trascrivi File Audio'.")
+            return
+
+        if self.is_recording:
+            messagebox.showwarning("Attendi",
+                                   "Interrompi la registrazione prima di trascrivere un file.")
+            return
+
+        if self.file_transcribing:
+            return
+
+        audio_path = Path(self.audio_file_var.get().strip())
+        if not audio_path.exists():
+            messagebox.showerror("Errore", "Seleziona un file audio valido")
+            return
+
+        try:
+            output_dir = self.ensure_output_dir()
+        except Exception as e:
+            messagebox.showerror("Errore", str(e))
+            return
+
+        if not self.transcriber:
+            messagebox.showerror("Errore", "Backend non disponibile")
+            return
+
+        self.file_transcribing = True
+        self.update_status("📝 Trascrizione file in corso...", WARNING_COLOR)
+        self._wipe_transcript_text()
+        self.update_file_controls()
+
+        filename = self.filename_var.get().strip() or audio_path.stem
+
+        def worker():
+            try:
+                result = self.transcriber.transcribe_audio_file(
+                    audio_path=audio_path,
+                    output_dir=output_dir,
+                    file_basename=filename
+                )
+                self.gui_queue.put({'type': 'file_transcription_done', 'result': result})
+            except Exception as e:
+                self.gui_queue.put({'type': 'file_transcription_error', 'error': str(e)})
+
+        self.file_thread = threading.Thread(target=worker, daemon=True)
+        self.file_thread.start()
+
+    def test_device(self):
+        """Esegue un test rapido sul dispositivo selezionato"""
+        if self.is_recording:
+            messagebox.showinfo("Registrazione in corso",
+                                "Termina la registrazione prima di testare il microfono.")
+            return
+
+        device_index = self.get_selected_device_index()
+        if device_index is None:
+            messagebox.showerror("Errore", "Seleziona un dispositivo audio da testare")
+            return
+
+        if not self.transcriber:
+            messagebox.showerror("Errore", "Backend non disponibile")
+            return
+
+        try:
+            self.update_status("🎧 Test microfono in corso...", WARNING_COLOR)
+            result = self.transcriber.test_input_device(device_index=device_index)
+            avg = result.get('average', 0.0)
+            peak = result.get('peak', 0.0)
+            active = result.get('active', False)
+
+            status = "Microfono attivo ✅" if active else "Nessuna attività rilevata ⚠️"
+            message = (f"Livello medio: {avg:.0f}\n"
+                       f"Picco: {peak:.0f}\n\n"
+                       f"{status}")
+            messagebox.showinfo("Test dispositivo", message)
+            self.update_status("Test completato", ACCENT_COLOR)
+        except Exception as e:
+            logger.error(f"Errore test microfono: {e}")
+            messagebox.showerror("Errore", f"Impossibile testare il dispositivo:\n{str(e)}")
+            self.update_status("✗ Test fallito", ERROR_COLOR)
     
     # ========================================================================
     # AGGIORNAMENTO REAL-TIME
@@ -506,7 +752,6 @@ class AudioTranscriberGUI:
     def _update_loop(self):
         """Thread per aggiornamento periodico statistiche e trascrizione"""
         start_time = time.time()
-        last_chunks = 0
         
         while self.should_update and self.is_recording:
             try:
@@ -539,14 +784,6 @@ class AudioTranscriberGUI:
                     'vu': vu_value
                 })
                 
-                # Se nuovo chunk processato, aggiungi placeholder per trascrizione
-                if status['chunks_processed'] > last_chunks:
-                    self.gui_queue.put({
-                        'type': 'transcript',
-                        'text': f"[Chunk {status['chunks_processed']} processato...]\n"
-                    })
-                    last_chunks = status['chunks_processed']
-                
                 time.sleep(0.5)  # Aggiorna ogni 500ms
                 
             except Exception as e:
@@ -569,11 +806,31 @@ class AudioTranscriberGUI:
                             self.queue_label['text'] = str(msg['queue'])
                             self.vu_meter['value'] = msg['vu']
                             self.vu_label['text'] = f"{msg['vu']}%"
-                        
+
                         elif msg['type'] == 'transcript':
                             # Aggiorna trascrizione
                             self.append_transcript(msg['text'])
-                    
+
+                        elif msg['type'] == 'file_transcription_done':
+                            self.file_transcribing = False
+                            result = msg['result']
+                            paths = [p for p in [result.get('audio_path'), result.get('transcript_path')] if p]
+                            info = "\n".join(str(p) for p in paths)
+                            if not info:
+                                info = str(self.output_dir)
+                            self.update_status("✓ File trascritto con successo", ACCENT_COLOR)
+                            messagebox.showinfo("Trascrizione completata",
+                                                 f"File salvati:\n{info}")
+                            self.reset_filename()
+                            self.update_file_controls()
+
+                        elif msg['type'] == 'file_transcription_error':
+                            self.file_transcribing = False
+                            self.update_status("✗ Errore trascrizione file", ERROR_COLOR)
+                            messagebox.showerror("Errore",
+                                                 f"Impossibile trascrivere il file:\n{msg['error']}")
+                            self.update_file_controls()
+
                     except queue.Empty:
                         break
             
@@ -589,13 +846,21 @@ class AudioTranscriberGUI:
     # ========================================================================
     # GESTIONE AREA TRASCRIZIONE
     # ========================================================================
+    def handle_transcript_line(self, text):
+        self.gui_queue.put({'type': 'transcript', 'text': text})
+
+    def _wipe_transcript_text(self):
+        self.transcript_text.config(state='normal')
+        self.transcript_text.delete(1.0, tk.END)
+        self.transcript_text.config(state='disabled')
+
     def append_transcript(self, text):
         """Aggiunge testo all'area trascrizione"""
         self.transcript_text.config(state='normal')
         self.transcript_text.insert(tk.END, text)
         self.transcript_text.see(tk.END)  # Auto-scroll
         self.transcript_text.config(state='disabled')
-    
+
     def clear_transcript(self):
         """Pulisce area trascrizione"""
         if self.is_recording:
@@ -603,10 +868,8 @@ class AudioTranscriberGUI:
                                       "Vuoi davvero pulire l'area trascrizione?\n"
                                       "La registrazione continuerà normalmente."):
                 return
-        
-        self.transcript_text.config(state='normal')
-        self.transcript_text.delete(1.0, tk.END)
-        self.transcript_text.config(state='disabled')
+
+        self._wipe_transcript_text()
     
     def copy_transcript(self):
         """Copia trascrizione negli appunti"""
@@ -649,10 +912,16 @@ class AudioTranscriberGUI:
                                       "Vuoi davvero uscire?\n"
                                       "La registrazione verrà salvata automaticamente."):
                 return
-            
+
             # Ferma registrazione
             self.stop_recording()
-        
+
+        if self.file_transcribing:
+            if not messagebox.askyesno("Trascrizione in corso",
+                                      "Una trascrizione di file è ancora attiva.\n"
+                                      "Chiudendo l'app verrà interrotta."):
+                return
+
         # Cleanup
         if self.transcriber:
             self.transcriber.cleanup()

@@ -2,13 +2,14 @@
 # Compatibile con PyInstaller per distribuzione standalone
 # VERSIONE CORRETTA: Risolve warning pkg_resources deprecato
 
-import os
 import sys
 import queue
 import threading
 import time
 import wave
 import logging
+import shutil
+import re
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -110,10 +111,19 @@ class AudioTranscriber:
         
         # Modello Whisper (caricato lazy)
         self.model = None
-        
+
+        # Callback per aggiornare la GUI in tempo reale
+        self.transcript_callback = None
+
         # Statistiche
         self.total_chunks_processed = 0
         self.start_time = None
+
+        # Percorsi correnti/ultimi file generati
+        self.current_transcript_path = None
+        self.current_audio_path = None
+        self.last_transcript_path = None
+        self.last_audio_path = None
         
         logger.info(f"AudioTranscriber inizializzato. Output: {self.output_dir}")
     
@@ -181,7 +191,53 @@ class AudioTranscriber:
         except Exception as e:
             logger.error(f"✗ Errore caricamento modello: {e}")
             return False
-    
+
+    # ========================================================================
+    # CALLBACK TRASCRIZIONE
+    # ========================================================================
+    def set_transcript_callback(self, callback):
+        """Registra callback per ricevere testo trascritto in tempo reale"""
+        self.transcript_callback = callback
+
+    def _emit_transcript(self, text):
+        if self.transcript_callback and text:
+            try:
+                self.transcript_callback(text)
+            except Exception as callback_error:
+                logger.error(f"Errore callback trascrizione: {callback_error}")
+
+    # ========================================================================
+    # UTILS PATH
+    # ========================================================================
+    def _sanitize_base_name(self, base_name):
+        if not base_name:
+            return ""
+        sanitized = re.sub(r"[^A-Za-z0-9_\-]", "_", base_name.strip())
+        return sanitized[:80]
+
+    def _prepare_output_paths(self, base_dir=None, base_name=None,
+                              include_audio=True, audio_extension=".wav"):
+        base_dir = Path(base_dir or self.output_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_base = self._sanitize_base_name(base_name) or f"session_{timestamp}"
+
+        counter = 1
+        candidate = safe_base
+        while True:
+            transcript_path = base_dir / f"{candidate}_transcription.txt"
+            audio_path = None
+            if include_audio:
+                audio_path = base_dir / f"{candidate}_audio{audio_extension}"
+            if transcript_path.exists() or (audio_path and audio_path.exists()):
+                candidate = f"{safe_base}_{counter}"
+                counter += 1
+                continue
+            break
+
+        return transcript_path, audio_path, candidate
+
     # ========================================================================
     # VOICE ACTIVITY DETECTION (semplice)
     # ========================================================================
@@ -302,12 +358,15 @@ class AudioTranscriber:
                             # Formato: [HH:MM:SS] Testo
                             line = f"[{timestamp}] {text}\n"
                             transcription_text += line
-                            
+
                             # Salva immediatamente su file
                             if self.transcript_file:
                                 self.transcript_file.write(line)
                                 self.transcript_file.flush()
-                            
+
+                            # Aggiorna eventuale callback
+                            self._emit_transcript(line)
+
                             logger.info(f"  Lingua: {info.language} | Testo: {text[:50]}...")
                     
                     elapsed_time = time.time() - start_time
@@ -332,7 +391,7 @@ class AudioTranscriber:
     # ========================================================================
     # API PUBBLICA
     # ========================================================================
-    def start_recording(self, device_index=None):
+    def start_recording(self, device_index=None, file_basename=None):
         """
         Avvia registrazione e trascrizione
         
@@ -351,23 +410,29 @@ class AudioTranscriber:
             if not self.load_model():
                 return False
             
-            # Timestamp per nomi file
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
+            # File output
+            transcript_path, wav_path, _ = self._prepare_output_paths(
+                base_dir=self.output_dir,
+                base_name=file_basename,
+                include_audio=True,
+                audio_extension=".wav"
+            )
+
             # File trascrizione
-            transcript_path = self.output_dir / f"trascrizione_{timestamp}.txt"
             self.transcript_file = open(transcript_path, 'w', encoding='utf-8')
             self.transcript_file.write(f"=== TRASCRIZIONE AVVIATA: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
             self.transcript_file.flush()
-            
+
             # File audio WAV
-            wav_path = self.output_dir / f"audio_{timestamp}.wav"
             self.wav_file = wave.open(str(wav_path), 'wb')
             self.wav_file.setnchannels(CHANNELS)
             self.wav_file.setsampwidth(2)  # 16-bit = 2 bytes
             self.wav_file.setframerate(RATE)
             self.wav_writer = self.wav_file
-            
+
+            self.current_transcript_path = transcript_path
+            self.current_audio_path = wav_path
+
             # Inizializza PyAudio
             self.pyaudio_instance = pyaudio.PyAudio()
             
@@ -402,7 +467,7 @@ class AudioTranscriber:
             logger.info(f"✓ Registrazione avviata con successo")
             logger.info(f"  Trascrizione: {transcript_path}")
             logger.info(f"  Audio: {wav_path}")
-            
+
             return True
         
         except Exception as e:
@@ -449,13 +514,21 @@ class AudioTranscriber:
                 self.wav_writer.close()
                 self.wav_writer = None
                 self.wav_file = None
-            
+
+            if self.current_audio_path:
+                self.last_audio_path = self.current_audio_path
+                self.current_audio_path = None
+
             # Chiudi file trascrizione
             if self.transcript_file:
                 self.transcript_file.write(f"\n\n=== TRASCRIZIONE TERMINATA: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                 self.transcript_file.write(f"Chunk processati: {self.total_chunks_processed}\n")
                 self.transcript_file.close()
                 self.transcript_file = None
+
+            if self.current_transcript_path:
+                self.last_transcript_path = self.current_transcript_path
+                self.current_transcript_path = None
             
             # Svuota queue
             while not self.audio_queue.empty():
@@ -484,13 +557,120 @@ class AudioTranscriber:
             'chunks_processed': self.total_chunks_processed,
             'queue_size': self.audio_queue.qsize()
         }
-    
+
     def cleanup(self):
         """Pulizia risorse (chiamare prima di uscire)"""
         if self.is_recording:
             self.stop_recording()
-        
+
         logger.info("Cleanup completato")
+
+    # ========================================================================
+    # TEST DISPOSITIVI AUDIO
+    # ========================================================================
+    def test_input_device(self, device_index=None, duration=2.0):
+        """Misura livello medio del dispositivo audio selezionato"""
+        p = pyaudio.PyAudio()
+        try:
+            idx = device_index if device_index is not None else self.device_index
+            if idx is None:
+                try:
+                    idx = p.get_default_input_device_info().get('index')
+                except Exception:
+                    idx = None
+            stream = p.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                input_device_index=idx,
+                frames_per_buffer=CHUNK_SIZE
+            )
+
+            levels = []
+            start = time.time()
+            while time.time() - start < duration:
+                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                rms = np.sqrt(np.mean(np.square(audio_data)))
+                levels.append(rms)
+
+            stream.stop_stream()
+            stream.close()
+
+            if not levels:
+                return {'average': 0.0, 'peak': 0.0, 'active': False}
+
+            avg = float(np.mean(levels))
+            peak = float(np.max(levels))
+            active = peak > VAD_THRESHOLD
+            return {'average': avg, 'peak': peak, 'active': active}
+
+        finally:
+            p.terminate()
+
+    # ========================================================================
+    # TRASCRIZIONE FILE ESISTENTE
+    # ========================================================================
+    def transcribe_audio_file(self, audio_path, output_dir=None,
+                              file_basename=None, language=None):
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"File audio non trovato: {audio_path}")
+
+        if not self.load_model():
+            raise RuntimeError("Impossibile caricare il modello Whisper")
+
+        target_dir = Path(output_dir or self.output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        transcript_path, audio_copy_path, base_name = self._prepare_output_paths(
+            base_dir=target_dir,
+            base_name=file_basename or audio_path.stem,
+            include_audio=True,
+            audio_extension=audio_path.suffix or '.wav'
+        )
+
+        # Copia il file audio sorgente per avere coppia completa
+        try:
+            if audio_path.resolve() != audio_copy_path.resolve():
+                shutil.copy2(audio_path, audio_copy_path)
+        except Exception as copy_error:
+            logger.warning(f"Impossibile copiare file audio: {copy_error}")
+
+        with open(transcript_path, 'w', encoding='utf-8') as transcript_out:
+            transcript_out.write(f"=== TRASCRIZIONE FILE: {audio_path.name} ===\n")
+            transcript_out.flush()
+
+            segments, info = self.model.transcribe(
+                str(audio_path),
+                language=language,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.5,
+                    min_speech_duration_ms=250
+                )
+            )
+
+            for segment in segments:
+                text = segment.text.strip()
+                if not text:
+                    continue
+                start_ts = time.strftime('%H:%M:%S', time.gmtime(segment.start))
+                line = f"[{start_ts}] {text}\n"
+                transcript_out.write(line)
+                transcript_out.flush()
+                self._emit_transcript(line)
+
+        logger.info(f"Trascrizione completata: {transcript_path}")
+        self.last_transcript_path = transcript_path
+        self.last_audio_path = audio_copy_path
+        return {
+            'transcript_path': transcript_path,
+            'audio_path': audio_copy_path,
+            'base_name': base_name
+        }
 
 # ============================================================================
 # TEST STANDALONE
