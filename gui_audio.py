@@ -1,5 +1,5 @@
-# whisperpy
-# cd "C:\Users\E26051\OneDrive - E.ON\Desktop\Work\Test\Audio\Script Pyhon\claude"
+# gui_audio.py - Interfaccia Grafica per Audio Transcriber
+# GUI con tkinter per registrazione e trascrizione real-time
 
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
@@ -149,7 +149,9 @@ class AudioTranscriberGUI:
         self.device_combo = ttk.Combobox(device_frame, state='readonly')
         self.device_combo.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
         
-        self.refresh_btn = ttk.Button(device_frame, text="🔄", width=3, command=self.refresh_devices, style='Normal.TButton')
+        self.refresh_btn = ttk.Button(device_frame, text="🔄", width=3, 
+                                      command=self.refresh_devices,
+                                      style='Normal.TButton')
         self.refresh_btn.grid(row=0, column=1)
         
         # Selezione cartella output
@@ -163,7 +165,9 @@ class AudioTranscriberGUI:
         self.output_entry.insert(0, str(self.output_dir))
         self.output_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
         
-        self.browse_btn = ttk.Button(output_frame, text="📁 Sfoglia", command=self.browse_output_dir,style='Normal.TButton')
+        self.browse_btn = ttk.Button(output_frame, text="📁 Sfoglia", 
+                                     command=self.browse_output_dir,
+                                     style='Normal.TButton')
         self.browse_btn.grid(row=0, column=1)
         
         # ====================================================================
@@ -500,37 +504,42 @@ class AudioTranscriberGUI:
     # AGGIORNAMENTO REAL-TIME
     # ========================================================================
     def _update_loop(self):
-        """Thread aggiornamento - AGGIUNTO AUDIO LEVEL REALE"""
+        """Thread per aggiornamento periodico statistiche e trascrizione"""
         start_time = time.time()
         last_chunks = 0
         
         while self.should_update and self.is_recording:
             try:
+                # Ottieni stato da transcriber
                 status = self.transcriber.get_status()
                 
                 if not status['recording']:
                     break
                 
-                # Tempo elapsed
+                # Calcola tempo elapsed
                 elapsed = int(time.time() - start_time)
                 hours = elapsed // 3600
                 minutes = (elapsed % 3600) // 60
                 seconds = elapsed % 60
                 time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
                 
-                # ⚠️ USA AUDIO LEVEL REALE (non simulato)
-                vu_value = int(status.get('audio_level', 0))
+                # Simula VU meter (in assenza di audio level reale)
+                # In produzione: leggere livello audio reale dallo stream
+                if status['queue_size'] > 0:
+                    vu_value = min(100, 30 + status['queue_size'] * 20)
+                else:
+                    vu_value = 0
                 
-                # Invia aggiornamenti
+                # Invia aggiornamenti a GUI queue
                 self.gui_queue.put({
                     'type': 'stats',
                     'time': time_str,
                     'chunks': status['chunks_processed'],
                     'queue': status['queue_size'],
-                    'vu': vu_value  # ⚠️ REALE
+                    'vu': vu_value
                 })
                 
-                # Se nuovo chunk, notifica
+                # Se nuovo chunk processato, aggiungi placeholder per trascrizione
                 if status['chunks_processed'] > last_chunks:
                     self.gui_queue.put({
                         'type': 'transcript',
@@ -538,10 +547,10 @@ class AudioTranscriberGUI:
                     })
                     last_chunks = status['chunks_processed']
                 
-                time.sleep(0.2)  # ⚠️ Aggiorna ogni 200ms (era 500ms) per VU meter più reattivo
+                time.sleep(0.5)  # Aggiorna ogni 500ms
                 
             except Exception as e:
-                logger.error(f"Errore update loop: {e}")
+                logger.error(f"Errore in update loop: {e}")
                 time.sleep(1)
     
     def start_gui_monitor(self):
