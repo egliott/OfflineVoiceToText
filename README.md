@@ -20,5 +20,5 @@ The application includes a tkinter GUI for input device selection, real-time tra
 ## Quick start
 
 ```bash
-git clone https://github.com/ggml-org/whisper.cpp.git
+git clone https://github.com/egliott/OfflineVoiceToText
 ```
