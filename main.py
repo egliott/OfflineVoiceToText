@@ -1,396 +1,555 @@
-"""Core logic for the offline real-time transcriber.
+# main.py - Sistema di Registrazione e Trascrizione Real-time
+# Compatibile con PyInstaller per distribuzione standalone
+# VERSIONE CORRETTA: Risolve warning pkg_resources deprecato
 
-This module exposes the :class:`RealTimeTranscriber` class which encapsulates
-all the audio capture and transcription logic used by the GUI.  The code is
-standalone, therefore it can be executed directly (``python main.py``) to test
-recording/transcription without the graphical interface.
-
-Key goals of this rewrite:
-    * Provide a single, easy to understand entry point.
-    * Guarantee clean startup/shutdown and extensive logging.
-    * Fix the Windows loopback distortion by matching the sampling parameters
-      of the chosen device and converting to the 16 kHz / mono format expected
-      by ``faster-whisper`` before transcription.
-"""
-from __future__ import annotations
-
-import argparse
-import logging
+import os
+import sys
 import queue
 import threading
 import time
-from dataclasses import dataclass
+import wave
+import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
-
 import numpy as np
-import pyaudiowpatch as pyaudio
+
+# Suppress pkg_resources deprecation warning da ctranslate2
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+
+# Audio libraries
+import pyaudio
+
+# Import faster-whisper DOPO aver soppresso i warnings
 from faster_whisper import WhisperModel
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-LOG_DIR = Path.home() / "AudioTranscriber_Logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "transcriber.log"
+# ============================================================================
+# CONFIGURAZIONE LOGGING
+# ============================================================================
+def setup_logging():
+    """Configura logging su file per debugging"""
+    log_dir = Path.home() / "AudioTranscriber_Logs"
+    log_dir.mkdir(exist_ok=True)
+    
+    log_file = log_dir / f"transcriber_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
-    ],
-)
-LOGGER = logging.getLogger(__name__)
+logger = setup_logging()
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-TARGET_SAMPLE_RATE = 16_000  # Whisper works best with 16 kHz mono audio
-SAMPLE_WIDTH = 2             # 16-bit PCM
-TARGET_CHANNELS = 1
+# ============================================================================
+# CONFIGURAZIONE AUDIO
+# ============================================================================
+CHUNK_SIZE = 1024  # Frame per buffer
+FORMAT = pyaudio.paInt16  # 16-bit audio
+CHANNELS = 1  # Mono
+RATE = 16000  # Sample rate (ottimale per Whisper)
+BUFFER_SECONDS = 30  # Secondi di audio per chunk di trascrizione
+VAD_THRESHOLD = 500  # Threshold per Voice Activity Detection (RMS)
 
-# Amount of raw audio (in seconds) that we send to the transcription thread
-CHUNK_DURATION_SECONDS = 5
-QUEUE_MAX_SIZE = 5
+# ============================================================================
+# GESTIONE PATH MODELLO WHISPER (compatibile con PyInstaller)
+# ============================================================================
+def get_model_path():
+    """
+    Determina il path corretto per i modelli Whisper.
+    Supporta sia esecuzione normale che da .exe
+    """
+    if getattr(sys, 'frozen', False):
+        # Running in PyInstaller bundle
+        base_path = Path(sys._MEIPASS)
+    else:
+        # Running in normal Python environment
+        base_path = Path.home() / ".cache" / "huggingface" / "hub"
+    
+    return base_path
 
-
-@dataclass
-class DeviceInfo:
-    """Simple representation of an audio device."""
-
-    index: int
-    name: str
-    max_input_channels: int
-    default_sample_rate: int
-    host_api: str
-    is_loopback: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-def _resample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
-    """Resample ``audio`` from ``orig_rate`` to ``target_rate`` using linear
-    interpolation.  ``audio`` must be a mono float32 signal in the [-1, 1] range."""
-
-    if orig_rate == target_rate or audio.size == 0:
-        return audio
-
-    duration = audio.size / orig_rate
-    target_length = int(duration * target_rate)
-    if target_length == 0:
-        return np.zeros(0, dtype=np.float32)
-
-    src_positions = np.linspace(0, audio.size - 1, num=target_length)
-    resampled = np.interp(src_positions, np.arange(audio.size), audio)
-    return resampled.astype(np.float32, copy=False)
-
-
-def _int16_bytes_to_mono_float32(
-    data: bytes,
-    channels: int,
-) -> np.ndarray:
-    """Convert raw int16 bytes into a mono float32 numpy array."""
-
-    if channels <= 0:
-        raise ValueError("The selected device does not expose input channels")
-
-    audio = np.frombuffer(data, dtype=np.int16)
-    if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
-    return (audio.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Core class
-# ---------------------------------------------------------------------------
-
-
-class RealTimeTranscriber:
-    """Manage audio capture and real-time transcription."""
-
-    def __init__(
-        self,
-        model_size: str = "turbo",
-        model_device: str = "cpu",
-        compute_type: str = "int8",
-    ) -> None:
-        self.model_size = model_size
-        self.model_device = model_device
-        self.compute_type = compute_type
-
-        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
-        self._record_thread: Optional[threading.Thread] = None
-        self._transcribe_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-        self._pa: Optional[pyaudio.PyAudio] = None
-        self._stream: Optional[pyaudio.Stream] = None
-        self._device_info: Optional[DeviceInfo] = None
-        self._device_channels: int = TARGET_CHANNELS
-        self._device_rate: int = TARGET_SAMPLE_RATE
-
-        self._model: Optional[WhisperModel] = None
-        self._chunks_processed = 0
-
-    # ------------------------------------------------------------------
-    # Device helpers
-    # ------------------------------------------------------------------
-    def get_audio_devices(self) -> List[DeviceInfo]:
-        """Enumerate available input and loopback devices."""
-
-        devices: List[DeviceInfo] = []
-        pa = pyaudio.PyAudio()
+# ============================================================================
+# CLASSE PRINCIPALE: AudioTranscriber
+# ============================================================================
+class AudioTranscriber:
+    def __init__(self, output_dir=None, device_index=None):
+        """
+        Inizializza il sistema di trascrizione
+        
+        Args:
+            output_dir: Directory per salvataggio file (default: Desktop/Trascrizioni)
+            device_index: Indice dispositivo audio (None = default)
+        """
+        self.output_dir = output_dir or (Path.home() / "Desktop" / "Trascrizioni")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.device_index = device_index
+        self.is_recording = False
+        self.is_transcribing = False
+        
+        # Queue thread-safe per passare audio da registrazione a trascrizione
+        self.audio_queue = queue.Queue(maxsize=10)
+        
+        # Thread
+        self.record_thread = None
+        self.transcribe_thread = None
+        
+        # PyAudio
+        self.pyaudio_instance = None
+        self.stream = None
+        
+        # File output
+        self.transcript_file = None
+        self.wav_file = None
+        self.wav_writer = None
+        
+        # Modello Whisper (caricato lazy)
+        self.model = None
+        
+        # Statistiche
+        self.total_chunks_processed = 0
+        self.start_time = None
+        
+        logger.info(f"AudioTranscriber inizializzato. Output: {self.output_dir}")
+    
+    # ========================================================================
+    # GESTIONE DISPOSITIVI AUDIO
+    # ========================================================================
+    def get_audio_devices(self):
+        """
+        Restituisce lista dispositivi audio disponibili
+        
+        Returns:
+            list: [(index, name, channels), ...]
+        """
+        devices = []
         try:
-            host_api_cache: Dict[int, str] = {}
-            for index in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(index)
-                max_input = int(info.get("maxInputChannels", 0))
-                # Loopback devices expose input channels even though they are
-                # internally capturing the output stream.  We flag them by
-                # checking the WASAPI property exposed by pyaudiowpatch.
-                is_loopback = bool(info.get("isLoopbackDevice", False))
-                if max_input == 0:
-                    continue
-
-                host_api_index = info.get("hostApi", 0)
-                host_api = host_api_cache.get(host_api_index)
-                if host_api is None:
-                    host_api = pa.get_host_api_info_by_index(host_api_index)["name"]
-                    host_api_cache[host_api_index] = host_api
-
-                devices.append(
-                    DeviceInfo(
-                        index=index,
-                        name=info.get("name", f"Device {index}"),
-                        max_input_channels=max_input,
-                        default_sample_rate=int(info.get("defaultSampleRate", TARGET_SAMPLE_RATE)),
-                        host_api=host_api,
-                        is_loopback=is_loopback,
-                    )
-                )
-        finally:
-            pa.terminate()
-        return devices
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-    def start(self, device_index: int) -> None:
-        """Start recording/transcription using ``device_index``."""
-
-        if self._record_thread and self._record_thread.is_alive():
-            raise RuntimeError("Recording is already running")
-
-        devices = {d.index: d for d in self.get_audio_devices()}
-        if device_index not in devices:
-            raise ValueError(f"Invalid device index: {device_index}")
-
-        self._device_info = devices[device_index]
-        self._device_rate = self._device_info.default_sample_rate
-        self._device_channels = min(self._device_info.max_input_channels, 2)
-        LOGGER.info(
-            "Selected device %s (loopback=%s, rate=%s Hz, channels=%s)",
-            self._device_info.name,
-            self._device_info.is_loopback,
-            self._device_rate,
-            self._device_channels,
-        )
-
-        self._ensure_model()
-
-        self._pa = pyaudio.PyAudio()
-        frames_per_buffer = max(1024, int(self._device_rate * 0.05))  # ~50 ms
-
-        open_kwargs = dict(
-            format=pyaudio.paInt16,
-            channels=self._device_channels,
-            rate=self._device_rate,
-            input=True,
-            input_device_index=device_index,
-            frames_per_buffer=frames_per_buffer,
-            stream_callback=None,
-        )
-
-        # When capturing loopback audio on WASAPI we explicitly pass the
-        # loopback flag to avoid distorted audio caused by driver resampling.
-        if self._device_info.is_loopback and hasattr(pyaudio, "PaWasapiStreamInfo"):
-            stream_info = pyaudio.PaWasapiStreamInfo(flags=pyaudio.paWinWasapiLoopback)
-            open_kwargs["stream_info"] = stream_info
-
-        self._stream = self._pa.open(**open_kwargs)
-        self._stop_event.clear()
-        self._chunks_processed = 0
-
-        self._record_thread = threading.Thread(target=self._recording_worker, daemon=True)
-        self._transcribe_thread = threading.Thread(target=self._transcription_worker, daemon=True)
-        self._record_thread.start()
-        self._transcribe_thread.start()
-        LOGGER.info("Recording started")
-
-    def stop(self) -> None:
-        """Stop recording and transcription threads."""
-
-        self._stop_event.set()
-        if self._record_thread:
-            self._record_thread.join()
-            self._record_thread = None
-        if self._transcribe_thread:
-            self._transcribe_thread.join()
-            self._transcribe_thread = None
-
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-            self._stream = None
-        if self._pa:
-            self._pa.terminate()
-            self._pa = None
-        LOGGER.info("Recording stopped")
-
-    def _ensure_model(self) -> None:
-        if self._model is None:
-            LOGGER.info("Loading faster-whisper model '%s'", self.model_size)
-            self._model = WhisperModel(
-                self.model_size,
-                device=self.model_device,
-                compute_type=self.compute_type,
-            )
-
-    # ------------------------------------------------------------------
-    # Worker threads
-    # ------------------------------------------------------------------
-    def _recording_worker(self) -> None:
-        assert self._stream is not None
-        assert self._device_info is not None
-
-        LOGGER.info("Recording thread ready")
-        bytes_per_frame = SAMPLE_WIDTH * self._device_channels
-        chunk_frames = int(self._device_rate * CHUNK_DURATION_SECONDS)
-        chunk_bytes_target = chunk_frames * bytes_per_frame
-        buffer = bytearray()
-
-        while not self._stop_event.is_set():
-            try:
-                data = self._stream.read(self._stream._frames_per_buffer, exception_on_overflow=False)
-            except Exception as exc:  # pragma: no cover - hardware errors
-                LOGGER.error("Audio read failed: %s", exc)
-                time.sleep(0.1)
-                continue
-
-            buffer.extend(data)
-            if len(buffer) < chunk_bytes_target:
-                continue
-
-            chunk = bytes(buffer[:chunk_bytes_target])
-            del buffer[:chunk_bytes_target]
-
-            float_audio = _int16_bytes_to_mono_float32(chunk, self._device_channels)
-            float_audio = _resample(float_audio, self._device_rate, TARGET_SAMPLE_RATE)
-
-            put = False
-            while not put and not self._stop_event.is_set():
+            p = pyaudio.PyAudio()
+            for i in range(p.get_device_count()):
                 try:
-                    self._audio_queue.put(float_audio, timeout=0.5)
-                    put = True
-                except queue.Full:
-                    LOGGER.warning("Audio queue is full; dropping oldest chunk")
-                    try:
-                        self._audio_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-
-    def _transcription_worker(self) -> None:
-        assert self._model is not None
-        LOGGER.info("Transcription thread ready")
-
-        while not self._stop_event.is_set():
-            try:
-                audio = self._audio_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            try:
-                segments, info = self._model.transcribe(
-                    audio,
-                    language=None,
-                    vad_filter=True,
-                    vad_parameters={"threshold": 0.3},
+                    info = p.get_device_info_by_index(i)
+                    # Solo dispositivi con input
+                    if info['maxInputChannels'] > 0:
+                        devices.append({
+                            'index': i,
+                            'name': info['name'],
+                            'channels': info['maxInputChannels'],
+                            'sample_rate': int(info['defaultSampleRate'])
+                        })
+                except Exception as e:
+                    logger.warning(f"Errore lettura device {i}: {e}")
+            p.terminate()
+            
+            logger.info(f"Trovati {len(devices)} dispositivi audio input")
+            return devices
+        
+        except Exception as e:
+            logger.error(f"Errore enumerazione dispositivi: {e}")
+            return []
+    
+    # ========================================================================
+    # CARICAMENTO MODELLO WHISPER
+    # ========================================================================
+    def load_model(self):
+        """Carica il modello Whisper (lazy loading)"""
+        if self.model is not None:
+            return True
+        
+        try:
+            logger.info("Caricamento modello Whisper 'turbo'...")
+            
+            # Sopprimi warnings durante il caricamento
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                
+                # Usa CPU con supporto INT8 per efficienza senza GPU
+                self.model = WhisperModel(
+                    "turbo",
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(get_model_path())
                 )
-                text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-                if text:
-                    self._chunks_processed += 1
-                    LOGGER.info("[%s] %s", info.language or "?", text)
-            except Exception as exc:  # pragma: no cover - model errors
-                LOGGER.error("Transcription failed: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Introspection helpers
-    # ------------------------------------------------------------------
-    def get_status(self) -> Dict[str, int]:
-        return {
-            "queue_size": self._audio_queue.qsize(),
-            "chunks_processed": self._chunks_processed,
-        }
-
-
-# ---------------------------------------------------------------------------
-# CLI for manual testing
-# ---------------------------------------------------------------------------
-
-def _print_devices(transcriber: RealTimeTranscriber) -> None:
-    print("Available input / loopback devices:\n")
-    for dev in transcriber.get_audio_devices():
-        loopback_flag = " (loopback)" if dev.is_loopback else ""
-        print(
-            f"[{dev.index:02d}] {dev.name}{loopback_flag} - "
-            f"{dev.default_sample_rate} Hz, {dev.max_input_channels} ch, API: {dev.host_api}"
-        )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Standalone test for RealTimeTranscriber")
-    parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
-    parser.add_argument("--device", type=int, default=None, help="Device index to use")
-    parser.add_argument("--duration", type=int, default=30, help="Seconds to run the test")
-    args = parser.parse_args()
-
-    transcriber = RealTimeTranscriber()
-
-    if args.list_devices:
-        _print_devices(transcriber)
-        return
-
-    devices = transcriber.get_audio_devices()
-    if not devices:
-        print("No audio devices available")
-        return
-
-    device_index = args.device if args.device is not None else devices[0].index
-    _print_devices(transcriber)
-    print(f"\nUsing device {device_index}")
-
-    try:
-        transcriber.start(device_index)
-        print("Recording... Press Ctrl+C to stop")
-        start_time = time.time()
-        while time.time() - start_time < args.duration:
-            time.sleep(2)
-            status = transcriber.get_status()
-            print(
-                f"\rChunks processed: {status['chunks_processed']:3d} | "
-                f"Queue fill: {status['queue_size']:2d}/{QUEUE_MAX_SIZE}",
-                end="",
+            
+            logger.info("✓ Modello Whisper caricato con successo")
+            return True
+        
+        except Exception as e:
+            logger.error(f"✗ Errore caricamento modello: {e}")
+            return False
+    
+    # ========================================================================
+    # VOICE ACTIVITY DETECTION (semplice)
+    # ========================================================================
+    def has_voice_activity(self, audio_data):
+        """
+        Rileva se c'è attività vocale nel chunk audio
+        
+        Args:
+            audio_data: numpy array con dati audio
+            
+        Returns:
+            bool: True se rilevata voce
+        """
+        # Calcola RMS (Root Mean Square) come indicatore di energia
+        rms = np.sqrt(np.mean(audio_data**2))
+        return rms > VAD_THRESHOLD
+    
+    # ========================================================================
+    # THREAD REGISTRAZIONE AUDIO
+    # ========================================================================
+    def _recording_thread(self):
+        """Thread per registrazione continua audio"""
+        logger.info("Thread registrazione avviato")
+        
+        frames_buffer = []
+        frames_in_buffer = 0
+        max_frames = int(RATE / CHUNK_SIZE * BUFFER_SECONDS)
+        
+        try:
+            while self.is_recording:
+                try:
+                    # Leggi chunk audio
+                    data = self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    
+                    # Salva su file WAV
+                    if self.wav_writer:
+                        self.wav_writer.writeframes(data)
+                    
+                    # Accumula nel buffer
+                    frames_buffer.append(data)
+                    frames_in_buffer += 1
+                    
+                    # Quando buffer pieno, invia a trascrizione
+                    if frames_in_buffer >= max_frames:
+                        # Converti in numpy array
+                        audio_data = np.frombuffer(b''.join(frames_buffer), dtype=np.int16)
+                        
+                        # VAD: solo se c'è voce
+                        if self.has_voice_activity(audio_data):
+                            try:
+                                # Converti a float32 normalizzato (richiesto da Whisper)
+                                audio_float = audio_data.astype(np.float32) / 32768.0
+                                
+                                # Invia a queue (non-blocking con timeout)
+                                self.audio_queue.put(audio_float, timeout=1)
+                                logger.debug(f"Chunk audio inviato a trascrizione ({len(audio_float)} samples)")
+                            
+                            except queue.Full:
+                                logger.warning("Queue piena, chunk audio scartato")
+                        else:
+                            logger.debug("Silenzio rilevato, chunk ignorato")
+                        
+                        # Reset buffer
+                        frames_buffer = []
+                        frames_in_buffer = 0
+                
+                except Exception as e:
+                    logger.error(f"Errore durante registrazione: {e}")
+                    time.sleep(0.1)
+        
+        except Exception as e:
+            logger.error(f"Errore fatale nel thread registrazione: {e}")
+        
+        finally:
+            logger.info("Thread registrazione terminato")
+    
+    # ========================================================================
+    # THREAD TRASCRIZIONE
+    # ========================================================================
+    def _transcription_thread(self):
+        """Thread per trascrizione continua"""
+        logger.info("Thread trascrizione avviato")
+        
+        try:
+            while self.is_transcribing:
+                try:
+                    # Preleva audio dalla queue (timeout per permettere shutdown)
+                    audio_data = self.audio_queue.get(timeout=1)
+                    
+                    logger.info(f"Trascrizione chunk {self.total_chunks_processed + 1}...")
+                    start_time = time.time()
+                    
+                    # Sopprimi warnings durante trascrizione
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        
+                        # TRASCRIZIONE con Whisper
+                        segments, info = self.model.transcribe(
+                            audio_data,
+                            language=None,  # Auto-detect italiano/inglese
+                            beam_size=5,
+                            vad_filter=True,  # VAD integrato di faster-whisper
+                            vad_parameters=dict(
+                                threshold=0.5,
+                                min_speech_duration_ms=250
+                            )
+                        )
+                    
+                    # Processa segmenti trascritti
+                    transcription_text = ""
+                    for segment in segments:
+                        text = segment.text.strip()
+                        if text:
+                            # Timestamp relativo dall'inizio registrazione
+                            elapsed = time.time() - self.start_time
+                            timestamp = time.strftime('%H:%M:%S', time.gmtime(elapsed))
+                            
+                            # Formato: [HH:MM:SS] Testo
+                            line = f"[{timestamp}] {text}\n"
+                            transcription_text += line
+                            
+                            # Salva immediatamente su file
+                            if self.transcript_file:
+                                self.transcript_file.write(line)
+                                self.transcript_file.flush()
+                            
+                            logger.info(f"  Lingua: {info.language} | Testo: {text[:50]}...")
+                    
+                    elapsed_time = time.time() - start_time
+                    self.total_chunks_processed += 1
+                    
+                    logger.info(f"✓ Chunk trascritto in {elapsed_time:.2f}s")
+                    
+                except queue.Empty:
+                    # Timeout normale, continua loop
+                    continue
+                
+                except Exception as e:
+                    logger.error(f"Errore durante trascrizione: {e}")
+                    time.sleep(1)
+        
+        except Exception as e:
+            logger.error(f"Errore fatale nel thread trascrizione: {e}")
+        
+        finally:
+            logger.info("Thread trascrizione terminato")
+    
+    # ========================================================================
+    # API PUBBLICA
+    # ========================================================================
+    def start_recording(self, device_index=None):
+        """
+        Avvia registrazione e trascrizione
+        
+        Args:
+            device_index: Indice dispositivo audio (None = default)
+            
+        Returns:
+            bool: True se avviato con successo
+        """
+        if self.is_recording:
+            logger.warning("Registrazione già in corso")
+            return False
+        
+        try:
+            # Carica modello se necessario
+            if not self.load_model():
+                return False
+            
+            # Timestamp per nomi file
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # File trascrizione
+            transcript_path = self.output_dir / f"trascrizione_{timestamp}.txt"
+            self.transcript_file = open(transcript_path, 'w', encoding='utf-8')
+            self.transcript_file.write(f"=== TRASCRIZIONE AVVIATA: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+            self.transcript_file.flush()
+            
+            # File audio WAV
+            wav_path = self.output_dir / f"audio_{timestamp}.wav"
+            self.wav_file = wave.open(str(wav_path), 'wb')
+            self.wav_file.setnchannels(CHANNELS)
+            self.wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+            self.wav_file.setframerate(RATE)
+            self.wav_writer = self.wav_file
+            
+            # Inizializza PyAudio
+            self.pyaudio_instance = pyaudio.PyAudio()
+            
+            # Apri stream audio
+            device_idx = device_index if device_index is not None else self.device_index
+            
+            self.stream = self.pyaudio_instance.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                input_device_index=device_idx,
+                frames_per_buffer=CHUNK_SIZE
             )
-        print()
-    except KeyboardInterrupt:
-        print("Interrupted by user")
-    finally:
-        transcriber.stop()
+            
+            logger.info(f"Stream audio aperto su device {device_idx}")
+            
+            # Reset statistiche
+            self.total_chunks_processed = 0
+            self.start_time = time.time()
+            
+            # Avvia threads
+            self.is_recording = True
+            self.is_transcribing = True
+            
+            self.record_thread = threading.Thread(target=self._recording_thread, daemon=True)
+            self.transcribe_thread = threading.Thread(target=self._transcription_thread, daemon=True)
+            
+            self.record_thread.start()
+            self.transcribe_thread.start()
+            
+            logger.info(f"✓ Registrazione avviata con successo")
+            logger.info(f"  Trascrizione: {transcript_path}")
+            logger.info(f"  Audio: {wav_path}")
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"✗ Errore avvio registrazione: {e}")
+            self.stop_recording()
+            return False
+    
+    def stop_recording(self):
+        """
+        Ferma registrazione e trascrizione salvando tutto
+        
+        Returns:
+            bool: True se fermato con successo
+        """
+        if not self.is_recording:
+            logger.warning("Nessuna registrazione in corso")
+            return False
+        
+        try:
+            logger.info("Fermo registrazione...")
+            
+            # Segnala stop ai threads
+            self.is_recording = False
+            self.is_transcribing = False
+            
+            # Attendi terminazione threads (max 5 secondi)
+            if self.record_thread:
+                self.record_thread.join(timeout=5)
+            if self.transcribe_thread:
+                self.transcribe_thread.join(timeout=5)
+            
+            # Chiudi stream audio
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+                self.stream = None
+            
+            if self.pyaudio_instance:
+                self.pyaudio_instance.terminate()
+                self.pyaudio_instance = None
+            
+            # Chiudi file WAV
+            if self.wav_writer:
+                self.wav_writer.close()
+                self.wav_writer = None
+                self.wav_file = None
+            
+            # Chiudi file trascrizione
+            if self.transcript_file:
+                self.transcript_file.write(f"\n\n=== TRASCRIZIONE TERMINATA: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                self.transcript_file.write(f"Chunk processati: {self.total_chunks_processed}\n")
+                self.transcript_file.close()
+                self.transcript_file = None
+            
+            # Svuota queue
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            logger.info(f"✓ Registrazione fermata. Totale chunk: {self.total_chunks_processed}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"✗ Errore durante stop: {e}")
+            return False
+    
+    def get_status(self):
+        """
+        Restituisce stato corrente
+        
+        Returns:
+            dict: {'recording': bool, 'transcribing': bool, 'chunks': int}
+        """
+        return {
+            'recording': self.is_recording,
+            'transcribing': self.is_transcribing,
+            'chunks_processed': self.total_chunks_processed,
+            'queue_size': self.audio_queue.qsize()
+        }
+    
+    def cleanup(self):
+        """Pulizia risorse (chiamare prima di uscire)"""
+        if self.is_recording:
+            self.stop_recording()
+        
+        logger.info("Cleanup completato")
 
-
+# ============================================================================
+# TEST STANDALONE
+# ============================================================================
 if __name__ == "__main__":
-    main()
+    print("=" * 60)
+    print("TEST AUDIO TRANSCRIBER - Modalità Standalone")
+    print("=" * 60)
+    
+    # Crea istanza
+    transcriber = AudioTranscriber()
+    
+    # Mostra dispositivi disponibili
+    print("\nDispositivi audio disponibili:")
+    devices = transcriber.get_audio_devices()
+    for dev in devices:
+        print(f"  [{dev['index']}] {dev['name']} ({dev['channels']} canali, {dev['sample_rate']} Hz)")
+    
+    if not devices:
+        print("\n✗ ERRORE: Nessun dispositivo audio trovato!")
+        sys.exit(1)
+    
+    # Selezione dispositivo
+    print(f"\nDispositivo default: {devices[0]['name']}")
+    choice = input("Premi INVIO per usare default o inserisci numero dispositivo: ").strip()
+    
+    device_idx = None
+    if choice.isdigit():
+        device_idx = int(choice)
+        if device_idx not in [d['index'] for d in devices]:
+            print(f"✗ Dispositivo {device_idx} non valido, uso default")
+            device_idx = None
+    
+    # Avvia registrazione
+    print("\n" + "=" * 60)
+    print("Avvio registrazione in 3 secondi...")
+    print("Premi CTRL+C per fermare")
+    print("=" * 60)
+    time.sleep(3)
+    
+    if not transcriber.start_recording(device_index=device_idx):
+        print("\n✗ ERRORE: Impossibile avviare registrazione!")
+        sys.exit(1)
+    
+    try:
+        # Loop stato
+        while True:
+            time.sleep(5)
+            status = transcriber.get_status()
+            print(f"\r[{datetime.now().strftime('%H:%M:%S')}] "
+                  f"Recording: {status['recording']} | "
+                  f"Chunks: {status['chunks_processed']} | "
+                  f"Queue: {status['queue_size']}", end='')
+    
+    except KeyboardInterrupt:
+        print("\n\nInterruzione richiesta...")
+    
+    finally:
+        transcriber.stop_recording()
+        transcriber.cleanup()
+        print("\n✓ Test completato. Controlla la cartella output per i file generati.")
+        print(f"   Output directory: {transcriber.output_dir}")
