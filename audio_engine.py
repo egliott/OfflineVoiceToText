@@ -1,10 +1,13 @@
-"""Audio engine abstraction used by the GUI and STT pipeline.
+"""Audio capture engine used by the GUI and STT pipeline.
 
-The actual project will eventually connect to native audio drivers. For this
-exercise we provide a light-weight simulation that mirrors the structure and
-error handling expected by the GUI. This allows the GUI, transcription logic
-and threading model to be validated without requiring native audio hardware in
-the execution environment.
+This implementation uses real audio devices exposed by the operating system.
+It supports both ``sounddevice`` (WASAPI on Windows allows enabling loopback by
+selecting a loopback-capable device) and ``pyaudio`` as a fallback backend.
+
+Loopback note for Windows users: loopback capture requires selecting a device
+labelled with ``(loopback)`` when WASAPI support is installed. Windows 11 users
+can enable it by activating the "Stereo Mix" device or any WASAPI loopback
+endpoint from the sound settings.
 """
 
 from __future__ import annotations
@@ -106,6 +109,77 @@ class AudioEngine:
             sleep_time = self.chunk_duration_ms / 1000.0
             time.sleep(sleep_time)
 
+    def _start_sounddevice_stream(self, device_id: int) -> None:
+        if sd is None:  # pragma: no cover - guard
+            raise RuntimeError("sounddevice backend not available")
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            device=device_id,
+            blocksize=self._chunk_frames,
+            callback=self._sounddevice_callback,
+        )
+        self._stream.start()
+
+    def _sounddevice_callback(self, indata, frames, time_info, status):  # pragma: no cover - runs in C callback
+        if status:
+            logger.warning("Sounddevice stream status: %s", status)
+        if self._chunk_queue is None:
+            return
+        # Copy data to avoid referencing the internal buffer after callback returns.
+        chunk = indata.copy().tobytes()
+        self._chunk_queue.put(chunk)
+
+    def _start_pyaudio_stream(self, device_id: int) -> None:
+        if pyaudio is None:  # pragma: no cover - guard
+            raise RuntimeError("PyAudio backend not available")
+
+        self._pa_instance = pyaudio.PyAudio()
+        self._stream = self._pa_instance.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.sample_rate,
+            input=True,
+            input_device_index=device_id,
+            frames_per_buffer=self._chunk_frames,
+        )
+
+        def producer():  # pragma: no cover - interacts with hardware
+            assert self._chunk_queue is not None
+            while not self._recording_event.is_set():
+                data = self._stream.read(self._chunk_frames, exception_on_overflow=False)
+                self._chunk_queue.put(data)
+
+        self._producer_thread = threading.Thread(target=producer, daemon=True)
+        self._producer_thread.start()
+
+    # ------------------------------------------------------------------
+    # Data processing
+    # ------------------------------------------------------------------
+    def _consumer_loop(self) -> None:
+        assert self._chunk_queue is not None
+        while not self._recording_event.is_set():
+            try:
+                chunk = self._chunk_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            with self._buffer_lock:
+                self._audio_buffer.extend(chunk)
+
+            self._latest_level = self._compute_level(chunk)
+
+            if self._callback:
+                try:
+                    self._callback(chunk)
+                except Exception:
+                    logger.exception("Chunk callback raised an exception")
+
+    # ------------------------------------------------------------------
+    # Recording shutdown
+    # ------------------------------------------------------------------
     def stop_recording(self):
         """Stop the simulated recording loop."""
 
@@ -114,6 +188,43 @@ class AudioEngine:
             self._recording_thread.join(timeout=2)
         self._recording_thread = None
 
+        self._recording_event.set()
+
+        if self._backend == "pyaudio" and self._producer_thread is not None:
+            self._producer_thread.join(timeout=2)
+
+        if self._stream is not None:
+            try:
+                if self._backend == "pyaudio":
+                    self._stream.stop_stream()
+                else:
+                    self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+        if self._backend == "pyaudio" and self._pa_instance is not None:
+            try:
+                self._pa_instance.terminate()
+            except Exception:
+                pass
+            self._pa_instance = None
+
+        if self._recording_thread and self._recording_thread.is_alive():
+            self._recording_thread.join(timeout=2)
+        self._recording_thread = None
+        self._producer_thread = None
+        self._chunk_queue = None
+        self._backend = None
+        self._recording_event.clear()
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
     def save_audio(self, output_path: str):
         """Persist the recorded byte buffer as a PCM WAV file."""
 
