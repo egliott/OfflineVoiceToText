@@ -20,16 +20,12 @@ def main() -> int:
     setup_logging(config.LOG_DIR)
     LOGGER = logging.getLogger(__name__)
 
-    model_cache = config.MODEL_DIR
-    os.makedirs(model_cache, exist_ok=True)
-    os.environ.setdefault("WHISPER_CACHE_DIR", model_cache)
+    model_path = config.MODEL_DIR
+    if not os.path.isdir(model_path):
+        os.makedirs(model_path, exist_ok=True)
+        LOGGER.warning("Model directory %s created (placeholder)", model_path)
 
-    default_model = getattr(config, "DEFAULT_WHISPER_MODEL", "small")
-    try:
-        stt_engine = STTEngine(model_name=default_model)
-    except Exception as exc:
-        LOGGER.error("Failed to load default Whisper model '%s': %s", default_model, exc)
-        return 1
+    stt_engine = STTEngine(model_path=model_path)
     audio_engine = AudioEngine(
         sample_rate=config.DEFAULT_SAMPLE_RATE, chunk_duration_ms=config.REALTIME_CHUNK_DURATION_MS
     )

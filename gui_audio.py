@@ -6,16 +6,10 @@ import logging
 import os
 import queue
 import threading
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-
-from stt_engine import STTEngine
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from audio_engine import AudioEngine
-    from config import AppConfig
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,15 +18,10 @@ LOGGER = logging.getLogger(__name__)
 class AudioTranscriptionGUI:
     """Main application window coordinating all UI interactions."""
 
-    def __init__(
-        self,
-        stt_engine: Optional[STTEngine],
-        audio_engine: "AudioEngine",
-        config: "AppConfig",
-    ):
-        self.stt_engine: Optional[STTEngine] = stt_engine
-        self.audio_engine: AudioEngine = audio_engine
-        self.config: AppConfig = config
+    def __init__(self, stt_engine, audio_engine, config):
+        self.stt_engine = stt_engine
+        self.audio_engine = audio_engine
+        self.config = config
 
         self.root = tk.Tk()
         self.root.title("Offline Voice To Text")
@@ -44,17 +33,9 @@ class AudioTranscriptionGUI:
         self.audio_file_var = tk.StringVar()
         self.output_folder_var = tk.StringVar()
         self.filename_var = tk.StringVar(value="meeting_notes")
-        default_model = getattr(self.config, "DEFAULT_WHISPER_MODEL", "small")
-        available_models = getattr(
-            self.stt_engine, "SUPPORTED_MODELS", STTEngine.SUPPORTED_MODELS
-        )
-        if default_model not in available_models:
-            default_model = available_models[0]
-        self.model_var = tk.StringVar(value=default_model)
         self.status_var = tk.StringVar(value="Idle")
 
         self.available_devices: list[dict] = []
-        self.available_models = available_models
         self.is_recording = False
         self.is_file_transcribing = False
         self._transcript_segments: list[str] = []
@@ -107,20 +88,8 @@ class AudioTranscriptionGUI:
         self.level_meter = ttk.Progressbar(device_frame, orient="horizontal", length=200, mode="determinate")
         self.level_meter.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
 
-        model_frame = ttk.LabelFrame(self.root, text="Whisper model")
-        model_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
-        model_frame.columnconfigure(1, weight=1)
-        ttk.Label(model_frame, text="Model:").grid(row=0, column=0, padx=5, pady=5)
-        self.model_combo = ttk.Combobox(
-            model_frame,
-            textvariable=self.model_var,
-            values=self.available_models,
-            state="readonly",
-        )
-        self.model_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-
         file_frame = ttk.LabelFrame(self.root, text="Audio file (batch mode)")
-        file_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        file_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
         file_frame.columnconfigure(1, weight=1)
         ttk.Label(file_frame, text="File:").grid(row=0, column=0, padx=5, pady=5)
         self.file_entry = ttk.Entry(file_frame, textvariable=self.audio_file_var)
@@ -129,7 +98,7 @@ class AudioTranscriptionGUI:
         self.file_button.grid(row=0, column=2, padx=5, pady=5)
 
         output_frame = ttk.LabelFrame(self.root, text="Output settings")
-        output_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
+        output_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
         output_frame.columnconfigure(1, weight=1)
         ttk.Label(output_frame, text="Folder:").grid(row=0, column=0, padx=5, pady=5)
         self.output_entry = ttk.Entry(output_frame, textvariable=self.output_folder_var)
@@ -146,7 +115,7 @@ class AudioTranscriptionGUI:
         )
 
         control_frame = ttk.Frame(self.root)
-        control_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=5)
+        control_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
         control_frame.columnconfigure((0, 1), weight=1)
         self.start_button = ttk.Button(control_frame, text="Start recording", command=self.on_start_recording)
         self.start_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
@@ -154,7 +123,7 @@ class AudioTranscriptionGUI:
         self.stop_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
         transcript_frame = ttk.LabelFrame(self.root, text="Transcription")
-        transcript_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=5)
+        transcript_frame.grid(row=5, column=0, sticky="nsew", padx=10, pady=5)
         transcript_frame.rowconfigure(0, weight=1)
         transcript_frame.columnconfigure(0, weight=1)
         self.transcript_text = tk.Text(transcript_frame, wrap="word", height=15)
@@ -164,7 +133,7 @@ class AudioTranscriptionGUI:
         self.transcript_text["yscrollcommand"] = scrollbar.set
 
         status_frame = ttk.Frame(self.root)
-        status_frame.grid(row=7, column=0, sticky="ew", padx=10, pady=(0, 10))
+        status_frame.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 10))
         ttk.Label(status_frame, text="Status:").pack(side=tk.LEFT)
         self.status_label = ttk.Label(status_frame, textvariable=self.status_var)
         self.status_label.pack(side=tk.LEFT, padx=5)
@@ -222,8 +191,6 @@ class AudioTranscriptionGUI:
     def _start_realtime_session(self):
         if self.is_recording:
             return
-        if not self._ensure_stt_model_loaded():
-            return
         try:
             device_id = self._get_selected_device_id()
         except ValueError as err:
@@ -251,13 +218,6 @@ class AudioTranscriptionGUI:
         except Exception as exc:  # pragma: no cover - depends on environment
             messagebox.showerror("Recording", f"Unable to start recording: {exc}")
             LOGGER.exception("Failed to start recording")
-            if self._realtime_stop_event:
-                self._realtime_stop_event.set()
-            if self._realtime_thread:
-                self._realtime_thread.join(timeout=2)
-            self._realtime_thread = None
-            self._realtime_queue = None
-            self._realtime_stop_event = None
             self.is_recording = False
             self._set_controls_running(False)
             return
@@ -275,11 +235,7 @@ class AudioTranscriptionGUI:
                 chunk = self._realtime_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if not self.stt_engine:
-                continue
             text = self.stt_engine.transcribe_chunk(chunk)
-            if not text:
-                continue
             self._transcript_segments.append(text)
             self.root.after(0, lambda t=text: self.update_transcription_text(t))
 
@@ -293,15 +249,11 @@ class AudioTranscriptionGUI:
         self.audio_engine.stop_recording()
         if self._realtime_thread:
             self._realtime_thread.join(timeout=2)
-        self._realtime_thread = None
-        self._realtime_queue = None
-        self._realtime_stop_event = None
 
         audio_path, text_path = self._current_output_paths or (None, "")
         if audio_path:
             self.audio_engine.save_audio(audio_path)
         self._save_transcript(text_path)
-        self._current_output_paths = None
 
         self.is_recording = False
         self._set_controls_running(False)
@@ -313,8 +265,6 @@ class AudioTranscriptionGUI:
     # ------------------------------------------------------------------
     def _start_file_transcription(self):
         if self.is_file_transcribing:
-            return
-        if not self._ensure_stt_model_loaded():
             return
 
         audio_file = self.audio_file_var.get().strip()
@@ -351,21 +301,19 @@ class AudioTranscriptionGUI:
                 return False
             return True
 
-        if not self.stt_engine:
-            self.root.after(0, lambda: messagebox.showerror("Whisper", "Model is not loaded."))
-            self.root.after(0, lambda: self._on_file_transcription_complete(text_path, False))
-            return
-
         try:
             final_text = self.stt_engine.transcribe_file(audio_file, callback_progress=progress_callback)
         except Exception as exc:  # pragma: no cover - I/O heavy
             LOGGER.exception("Transcription failed")
             self.root.after(0, lambda: messagebox.showerror("Transcription", str(exc)))
             final_text = ""
-        if final_text and not self._transcript_segments:
-            self._transcript_segments.append(final_text)
-        has_text = bool(final_text.strip()) or bool(self._transcript_segments)
-        self.root.after(0, lambda: self._on_file_transcription_complete(text_path, has_text))
+
+        if final_text:
+            self._save_transcript(text_path)
+
+        self.is_file_transcribing = False
+        self._set_controls_running(False)
+        self.update_status("Idle")
 
     def _stop_file_transcription(self):
         if not self.is_file_transcribing:
@@ -374,27 +322,14 @@ class AudioTranscriptionGUI:
             self._file_cancel_event.set()
         if self._file_thread:
             self._file_thread.join(timeout=2)
-        self._file_thread = None
-        self._file_cancel_event = None
         self.is_file_transcribing = False
         self._set_controls_running(False)
         self.update_status("Idle")
-        self._current_output_paths = None
         LOGGER.info("Batch transcription cancelled")
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
-    def _on_file_transcription_complete(self, text_path: str, has_text: bool):
-        if has_text:
-            self._save_transcript(text_path)
-        self.is_file_transcribing = False
-        self._set_controls_running(False)
-        self.update_status("Idle")
-        self._file_thread = None
-        self._file_cancel_event = None
-        self._current_output_paths = None
-
     def _validate_common_settings(self) -> bool:
         folder = self.output_folder_var.get().strip()
         filename = self.filename_var.get().strip()
@@ -430,9 +365,7 @@ class AudioTranscriptionGUI:
             counter += 1
 
     def _save_transcript(self, text_path: str):
-        folder = os.path.dirname(text_path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
+        os.makedirs(os.path.dirname(text_path), exist_ok=True)
         with open(text_path, "w", encoding="utf-8") as f:
             f.write("\n".join(self._transcript_segments))
         LOGGER.info("Transcription saved to %s", text_path)
@@ -454,22 +387,6 @@ class AudioTranscriptionGUI:
             if device["name"] == selected_name:
                 return device["id"]
         raise ValueError("Selected audio device is not available.")
-
-    def _ensure_stt_model_loaded(self) -> bool:
-        model_name = self.model_var.get().strip()
-        if not model_name:
-            messagebox.showwarning("Model", "Please select a Whisper model.")
-            return False
-        try:
-            if self.stt_engine is None:
-                self.stt_engine = STTEngine(model_name=model_name)
-            else:
-                self.stt_engine.ensure_model(model_name)
-        except Exception as exc:
-            LOGGER.exception("Failed to load Whisper model")
-            messagebox.showerror("Whisper", f"Unable to load model '{model_name}': {exc}")
-            return False
-        return True
 
     # ------------------------------------------------------------------
     # Live UI updates
