@@ -9,6 +9,7 @@ class AppConfig:
     SUPPORTED_AUDIO_FORMATS = [".wav", ".mp3", ".flac"]
     LOG_DIR = "logs"
     MODEL_DIR = "models"
+    DEFAULT_WHISPER_MODEL = "small"
 
 def load_config() -> AppConfig:
     """Return config object."""
